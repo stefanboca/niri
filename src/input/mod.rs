@@ -754,6 +754,7 @@ impl State {
                             write_to_disk,
                             show_pointer,
                             path,
+                            None,
                         ) {
                             warn!("error taking screenshot: {err:?}");
                         }
@@ -778,6 +779,7 @@ impl State {
                             write_to_disk,
                             show_pointer,
                             path,
+                            None,
                         ) {
                             warn!("error taking screenshot: {err:?}");
                         }

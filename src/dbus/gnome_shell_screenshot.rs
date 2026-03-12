@@ -15,7 +15,7 @@ pub struct Screenshot {
 
 pub enum ScreenshotToNiri {
     TakeInteractiveScreenshot(async_channel::Sender<Option<PathBuf>>),
-    TakeScreenshot { include_cursor: bool },
+    TakeScreenshot { include_cursor: bool, window: bool },
     PickColor(async_channel::Sender<Option<PickedColor>>),
 }
 
@@ -60,10 +60,10 @@ impl Screenshot {
         _flash: bool,
         _filename: PathBuf,
     ) -> fdo::Result<(bool, PathBuf)> {
-        if let Err(err) = self
-            .to_niri
-            .send(ScreenshotToNiri::TakeScreenshot { include_cursor })
-        {
+        if let Err(err) = self.to_niri.send(ScreenshotToNiri::TakeScreenshot {
+            include_cursor,
+            window: false,
+        }) {
             warn!("error sending message to niri: {err:?}");
             return Err(fdo::Error::Failed("internal error".to_owned()));
         }
@@ -108,6 +108,35 @@ impl Screenshot {
         );
 
         Ok(result)
+    }
+
+    async fn screenshot_window(
+        &self,
+        _include_frame: bool,
+        include_cursor: bool,
+        _flash: bool,
+        _filename: PathBuf,
+    ) -> fdo::Result<(bool, PathBuf)> {
+        if let Err(err) = self.to_niri.send(ScreenshotToNiri::TakeScreenshot {
+            include_cursor,
+            window: true,
+        }) {
+            warn!("error sending message to niri: {err:?}");
+            return Err(fdo::Error::Failed("internal error".to_owned()));
+        }
+
+        let filename = match self.from_niri.recv().await {
+            Ok(NiriToScreenshot::ScreenshotResult(Some(filename))) => filename,
+            Ok(NiriToScreenshot::ScreenshotResult(None)) => {
+                return Err(fdo::Error::Failed("internal error".to_owned()));
+            }
+            Err(err) => {
+                warn!("error receiving message from niri: {err:?}");
+                return Err(fdo::Error::Failed("internal error".to_owned()));
+            }
+        };
+
+        Ok((true, filename))
     }
 }
 

@@ -2074,8 +2074,11 @@ impl State {
                 self.open_screenshot_ui(true, None, Some(to_screenshot));
                 self.niri.cancel_mru();
             }
-            ScreenshotToNiri::TakeScreenshot { include_cursor } => {
-                self.handle_take_screenshot(to_screenshot, include_cursor);
+            ScreenshotToNiri::TakeScreenshot {
+                include_cursor,
+                window,
+            } => {
+                self.handle_take_screenshot(to_screenshot, include_cursor, window);
             }
             ScreenshotToNiri::PickColor(tx) => {
                 self.handle_pick_color(tx);
@@ -2088,6 +2091,7 @@ impl State {
         &mut self,
         to_screenshot: &async_channel::Sender<NiriToScreenshot>,
         include_cursor: bool,
+        window: bool,
     ) {
         let _span = tracy_client::span!("TakeScreenshot");
 
@@ -2102,9 +2106,26 @@ impl State {
                 }
             };
 
-            let res = self
-                .niri
-                .screenshot_all_outputs(renderer, include_cursor, Box::new(on_done));
+            let res = if window {
+                self.niri
+                    .layout
+                    .focus_with_output()
+                    .context("no focused window")
+                    .and_then(|(mapped, output)| {
+                        self.niri.screenshot_window(
+                            renderer,
+                            output,
+                            mapped,
+                            true,
+                            include_cursor,
+                            None,
+                            Some(Box::new(on_done)),
+                        )
+                    })
+            } else {
+                self.niri
+                    .screenshot_all_outputs(renderer, include_cursor, Box::new(on_done))
+            };
 
             if let Err(err) = res {
                 warn!("error taking a screenshot: {err:?}");
@@ -5266,6 +5287,7 @@ impl Niri {
         write_to_disk: bool,
         show_pointer: bool,
         path: Option<String>,
+        on_done: Option<Box<dyn FnOnce(Option<PathBuf>) + Send + 'static>>,
     ) -> anyhow::Result<()> {
         let _span = tracy_client::span!("Niri::screenshot_window");
 
@@ -5317,7 +5339,7 @@ impl Niri {
             elements,
         )?;
 
-        self.save_screenshot(geo.size, pixels, write_to_disk, path, None);
+        self.save_screenshot(geo.size, pixels, write_to_disk, path, on_done);
 
         Ok(())
     }
