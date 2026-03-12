@@ -1938,7 +1938,12 @@ impl State {
         self.niri.output_management_state.notify_changes(new_config);
     }
 
-    pub fn open_screenshot_ui(&mut self, show_pointer: bool, path: Option<String>) {
+    pub fn open_screenshot_ui(
+        &mut self,
+        show_pointer: bool,
+        path: Option<String>,
+        to_screenshot: Option<async_channel::Sender<Option<PathBuf>>>,
+    ) {
         if self.niri.is_locked() || self.niri.screenshot_ui.is_open() {
             return;
         }
@@ -1971,9 +1976,14 @@ impl State {
         }
 
         self.backend.with_primary_renderer(|renderer| {
-            self.niri
-                .screenshot_ui
-                .open(renderer, screenshots, default_output, show_pointer, path)
+            self.niri.screenshot_ui.open(
+                renderer,
+                screenshots,
+                default_output,
+                show_pointer,
+                path,
+                to_screenshot,
+            )
         });
 
         self.niri
@@ -1999,23 +2009,49 @@ impl State {
     }
 
     pub fn confirm_screenshot(&mut self, write_to_disk: bool) {
-        let ScreenshotUi::Open { path, .. } = &mut self.niri.screenshot_ui else {
+        let ScreenshotUi::Open {
+            path,
+            to_screenshot,
+            ..
+        } = &mut self.niri.screenshot_ui
+        else {
             return;
         };
         let path = path.take();
+        let to_screenshot = to_screenshot.take();
 
-        self.backend.with_primary_renderer(|renderer| {
+        let rv = self.backend.with_primary_renderer(|renderer| {
             match self.niri.screenshot_ui.capture(renderer) {
                 Ok((size, pixels)) => {
-                    if let Err(err) = self.niri.save_screenshot(size, pixels, write_to_disk, path) {
-                        warn!("error saving screenshot: {err:?}");
-                    }
+                    let on_done = to_screenshot.clone().map(|to_screenshot| {
+                        Box::new(move |path| {
+                            if let Err(err) = to_screenshot.send_blocking(path) {
+                                warn!("error sending path to screenshot: {err:?}");
+                            }
+                        }) as Box<dyn FnOnce(_) + Send>
+                    });
+
+                    self.niri
+                        .save_screenshot(size, pixels, write_to_disk, path, on_done);
                 }
                 Err(err) => {
                     warn!("error capturing screenshot: {err:?}");
+                    if let Some(to_screenshot) = to_screenshot.as_ref() {
+                        if let Err(err) = to_screenshot.send_blocking(None) {
+                            warn!("error sending None to screenshot: {err:?}");
+                        }
+                    }
                 }
             }
         });
+
+        if rv.is_none() {
+            if let Some(to_screenshot) = to_screenshot {
+                if let Err(err) = to_screenshot.send_blocking(None) {
+                    warn!("error sending None to screenshot: {err:?}");
+                }
+            }
+        }
 
         self.niri.screenshot_ui.close();
         self.niri
@@ -2034,6 +2070,10 @@ impl State {
         msg: ScreenshotToNiri,
     ) {
         match msg {
+            ScreenshotToNiri::TakeInteractiveScreenshot(to_screenshot) => {
+                self.open_screenshot_ui(true, None, Some(to_screenshot));
+                self.niri.cancel_mru();
+            }
             ScreenshotToNiri::TakeScreenshot { include_cursor } => {
                 self.handle_take_screenshot(to_screenshot, include_cursor);
             }
@@ -2055,7 +2095,7 @@ impl State {
             let on_done = {
                 let to_screenshot = to_screenshot.clone();
                 move |path| {
-                    let msg = NiriToScreenshot::ScreenshotResult(Some(path));
+                    let msg = NiriToScreenshot::ScreenshotResult(path);
                     if let Err(err) = to_screenshot.send_blocking(msg) {
                         warn!("error sending path to screenshot: {err:?}");
                     }
@@ -2064,7 +2104,7 @@ impl State {
 
             let res = self
                 .niri
-                .screenshot_all_outputs(renderer, include_cursor, on_done);
+                .screenshot_all_outputs(renderer, include_cursor, Box::new(on_done));
 
             if let Err(err) = res {
                 warn!("error taking a screenshot: {err:?}");
@@ -5213,8 +5253,9 @@ impl Niri {
             elements,
         )?;
 
-        self.save_screenshot(size, pixels, write_to_disk, path)
-            .context("error saving screenshot")
+        self.save_screenshot(size, pixels, write_to_disk, path, None);
+
+        Ok(())
     }
 
     pub fn screenshot_window(
@@ -5276,8 +5317,9 @@ impl Niri {
             elements,
         )?;
 
-        self.save_screenshot(geo.size, pixels, write_to_disk, path)
-            .context("error saving screenshot")
+        self.save_screenshot(geo.size, pixels, write_to_disk, path, None);
+
+        Ok(())
     }
 
     pub fn save_screenshot(
@@ -5286,8 +5328,9 @@ impl Niri {
         pixels: Vec<u8>,
         write_to_disk: bool,
         path_arg: Option<String>,
-    ) -> anyhow::Result<()> {
-        let path = write_to_disk
+        on_done: Option<Box<dyn FnOnce(Option<PathBuf>) + Send + 'static>>,
+    ) {
+        let path = (write_to_disk || on_done.is_some())
             .then(|| {
                 // When given an explicit path, don't try to strftime it or create parents.
                 path_arg.map(|p| (PathBuf::from(p), false)).or_else(|| {
@@ -5295,7 +5338,11 @@ impl Niri {
                         Ok(path) => path.map(|p| (p, true)),
                         Err(err) => {
                             warn!("error making screenshot path: {err:?}");
-                            None
+                            on_done.is_some().then(|| {
+                                let mut path = env::temp_dir();
+                                path.push("screenshot.png");
+                                (path, false)
+                            })
                         }
                     }
                 })
@@ -5371,6 +5418,10 @@ impl Niri {
                 debug!("not saving screenshot to disk");
             }
 
+            if let Some(on_done) = on_done {
+                on_done(image_path.clone());
+            }
+
             #[cfg(feature = "dbus")]
             if let Err(err) = crate::utils::show_screenshot_notification(image_path.as_deref()) {
                 warn!("error showing screenshot notification: {err:?}");
@@ -5383,8 +5434,6 @@ impl Niri {
                 .map(|s| s.to_owned());
             let _ = event_tx.send(path_string);
         });
-
-        Ok(())
     }
 
     #[cfg(feature = "dbus")]
@@ -5392,7 +5441,7 @@ impl Niri {
         &mut self,
         renderer: &mut GlesRenderer,
         include_pointer: bool,
-        on_done: impl FnOnce(PathBuf) + Send + 'static,
+        on_done: Box<dyn FnOnce(Option<PathBuf>) + Send + 'static>,
     ) -> anyhow::Result<()> {
         let _span = tracy_client::span!("Niri::screenshot_all_outputs");
 
@@ -5429,33 +5478,7 @@ impl Niri {
             elements,
         )?;
 
-        let path = make_screenshot_path(&self.config.borrow())
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| {
-                let mut path = env::temp_dir();
-                path.push("screenshot.png");
-                path
-            });
-        debug!("saving screenshot to {path:?}");
-
-        thread::spawn(move || {
-            let file = match std::fs::File::create(&path) {
-                Ok(file) => file,
-                Err(err) => {
-                    warn!("error creating file: {err:?}");
-                    return;
-                }
-            };
-
-            let w = std::io::BufWriter::new(file);
-            if let Err(err) = write_png_rgba8(w, size.w as u32, size.h as u32, &pixels) {
-                warn!("error encoding screenshot image: {err:?}");
-                return;
-            }
-
-            on_done(path);
-        });
+        self.save_screenshot(size, pixels, true, None, Some(on_done));
 
         Ok(())
     }

@@ -3,6 +3,7 @@ use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::f64::consts::TAU;
 use std::iter::zip;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use anyhow::Context;
@@ -64,6 +65,7 @@ pub enum ScreenshotUi {
         clock: Clock,
         config: Rc<RefCell<Config>>,
         path: Option<String>,
+        to_screenshot: Option<async_channel::Sender<Option<PathBuf>>>,
     },
 }
 
@@ -143,6 +145,7 @@ impl ScreenshotUi {
         default_output: Output,
         show_pointer: bool,
         path: Option<String>,
+        to_screenshot: Option<async_channel::Sender<Option<PathBuf>>>,
     ) -> bool {
         if screenshots.is_empty() {
             return false;
@@ -238,6 +241,7 @@ impl ScreenshotUi {
             clock: clock.clone(),
             config: config.clone(),
             path,
+            to_screenshot,
         };
 
         self.update_buffers();
@@ -250,11 +254,18 @@ impl ScreenshotUi {
             selection,
             clock,
             config,
+            to_screenshot,
             ..
         } = self
         else {
             return false;
         };
+
+        if let Some(to_screenshot) = to_screenshot.take() {
+            if let Err(err) = to_screenshot.send_blocking(None) {
+                warn!("error sending None to screenshot: {err:?}");
+            }
+        }
 
         let last_selection = Some((
             selection.0.downgrade(),

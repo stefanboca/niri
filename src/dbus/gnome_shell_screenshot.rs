@@ -14,6 +14,7 @@ pub struct Screenshot {
 }
 
 pub enum ScreenshotToNiri {
+    TakeInteractiveScreenshot(async_channel::Sender<Option<PathBuf>>),
     TakeScreenshot { include_cursor: bool },
     PickColor(async_channel::Sender<Option<PickedColor>>),
 }
@@ -24,6 +25,35 @@ pub enum NiriToScreenshot {
 
 #[interface(name = "org.gnome.Shell.Screenshot")]
 impl Screenshot {
+    async fn interactive_screenshot(&self) -> fdo::Result<(bool, String)> {
+        let (tx, rx) = async_channel::bounded(1);
+        if let Err(err) = self
+            .to_niri
+            .send(ScreenshotToNiri::TakeInteractiveScreenshot(tx))
+        {
+            warn!("error sending interactive screenshot message to niri: {err:?}");
+            return Err(fdo::Error::Failed("internal error".to_owned()));
+        }
+
+        match rx.recv().await {
+            Ok(Some(filename)) => match pango::glib::filename_to_uri(filename, None)
+                .as_ref()
+                .map(|url| url.as_str().to_owned())
+            {
+                Ok(filename) => Ok((true, filename)),
+                Err(err) => {
+                    warn!("error converting screenshot path to file url: {err:?}");
+                    Err(fdo::Error::Failed("internal error".to_owned()))
+                }
+            },
+            Ok(None) => Ok((false, String::new())),
+            Err(err) => {
+                warn!("error receiving message from niri: {err:?}");
+                Err(fdo::Error::Failed("internal error".to_owned()))
+            }
+        }
+    }
+
     async fn screenshot(
         &self,
         include_cursor: bool,
